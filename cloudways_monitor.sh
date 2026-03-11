@@ -24,6 +24,76 @@ extract_error() {
   jq -r '.message // .error // .errors[0].message // empty' <<<"$body" 2>/dev/null || true
 }
 
+is_json() {
+  local body="$1"
+  jq -e . >/dev/null 2>&1 <<<"$body"
+}
+
+is_truthy() {
+  local value="$1"
+  case "${value,,}" in
+    1|true|yes|completed|done|success) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+poll_operation_until_complete() {
+  local access_token="$1"
+  local operation_id="$2"
+  local max_attempts="${3:-30}"
+  local sleep_seconds="${4:-2}"
+  local poll_body_file="$5"
+
+  local attempt=1
+  local poll_http_code=""
+  local poll_response=""
+  local completion_value=""
+  local status_value=""
+  local api_error=""
+
+  declare -a operation_candidates=(
+    "https://api.cloudways.com/api/v2/operation/${operation_id}"
+    "https://api.cloudways.com/api/v1/operation/${operation_id}"
+  )
+
+  while [[ "$attempt" -le "$max_attempts" ]]; do
+    for operation_url in "${operation_candidates[@]}"; do
+      poll_http_code="$(curl -sS -o "$poll_body_file" -w "%{http_code}" \
+        -X GET "$operation_url" \
+        -H "Accept: application/json" \
+        -H "Authorization: Bearer ${access_token}")"
+      poll_response="$(<"$poll_body_file")"
+
+      if [[ ! "$poll_http_code" =~ ^2 ]] || ! is_json "$poll_response"; then
+        continue
+      fi
+
+      completion_value="$(jq -r '.operation.is_completed // .is_completed // empty' <<<"$poll_response" 2>/dev/null || true)"
+      status_value="$(jq -r '.operation.status // .status // empty' <<<"$poll_response" 2>/dev/null || true)"
+      api_error="$(extract_error "$poll_response")"
+
+      if [[ -n "$api_error" && "$api_error" != "null" ]]; then
+        echo "Operation API error: $api_error" >&2
+      fi
+
+      if is_truthy "$completion_value" || is_truthy "$status_value"; then
+        echo "$poll_response"
+        return 0
+      fi
+    done
+
+    sleep "$sleep_seconds"
+    attempt=$((attempt + 1))
+  done
+
+  echo "Timed out waiting for operation_id=${operation_id} to complete." >&2
+  if [[ -n "${poll_response:-}" ]]; then
+    echo "Last operation response:" >&2
+    echo "$poll_response" >&2
+  fi
+  return 1
+}
+
 request_token_json() {
   local token_url="$1"
   local email="$2"
@@ -65,7 +135,8 @@ main() {
   echo "Generating access token..."
   token_body_file="$(mktemp)"
   monitor_body_file="$(mktemp)"
-  trap 'rm -f "$token_body_file" "$monitor_body_file"' EXIT
+  operation_body_file="$(mktemp)"
+  trap 'rm -f "$token_body_file" "$monitor_body_file" "$operation_body_file"' EXIT
 
   access_token=""
   http_code=""
@@ -135,6 +206,7 @@ main() {
 
   monitor_http_code=""
   monitor_response=""
+  selected_monitor_url=""
   declare -a monitor_candidates=(
     "https://api.cloudways.com/api/v2/server/monitor/${SERVER_ID}?type=${TYPE}"
     "https://api.cloudways.com/api/v1/server/monitor/${SERVER_ID}?type=${TYPE}"
@@ -146,12 +218,17 @@ main() {
       -H "Accept: application/json" \
       -H "Authorization: Bearer ${access_token}")"
     monitor_response="$(<"$monitor_body_file")"
-    if [[ "$monitor_http_code" =~ ^2 ]]; then
+    if [[ "$monitor_http_code" =~ ^2 ]] && is_json "$monitor_response"; then
+      # Guard against generic placeholder responses from the API root.
+      if [[ "$(extract_error "$monitor_response")" == "You have reached Cloudways API." ]]; then
+        continue
+      fi
+      selected_monitor_url="$monitor_url"
       break
     fi
   done
 
-  if [[ ! "$monitor_http_code" =~ ^2 ]]; then
+  if [[ ! "$monitor_http_code" =~ ^2 ]] || [[ -z "$selected_monitor_url" ]]; then
     echo "Monitoring request failed (HTTP $monitor_http_code)." >&2
     api_error="$(extract_error "$monitor_response")"
     if [[ -n "$api_error" ]]; then
@@ -162,11 +239,21 @@ main() {
     exit 1
   fi
 
-  if jq -e . >/dev/null 2>&1 <<<"$monitor_response"; then
-    jq . <<<"$monitor_response"
-  else
-    echo "$monitor_response"
+  operation_id="$(jq -r '.operation_id // .operation.id // empty' <<<"$monitor_response" 2>/dev/null || true)"
+  if [[ -n "$operation_id" ]]; then
+    echo "Operation queued (operation_id=${operation_id}). Waiting for completion..."
+    poll_result="$(poll_operation_until_complete "$access_token" "$operation_id" 45 2 "$operation_body_file")"
+    # If operation endpoint returns monitor payload details, prefer that.
+    if is_json "$poll_result"; then
+      maybe_result_data="$(jq -c '.result // .data // empty' <<<"$poll_result" 2>/dev/null || true)"
+      if [[ -n "$maybe_result_data" && "$maybe_result_data" != "null" ]]; then
+        jq . <<<"$maybe_result_data"
+        exit 0
+      fi
+    fi
   fi
+
+  jq . <<<"$monitor_response"
 }
 
 main "$@"
