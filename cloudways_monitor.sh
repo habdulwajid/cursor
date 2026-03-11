@@ -119,6 +119,19 @@ request_token_form() {
     --data-urlencode "api_key=${api_key}"
 }
 
+request_token_query() {
+  local token_url="$1"
+  local email="$2"
+  local api_key="$3"
+  local body_file="$4"
+
+  curl -sS -o "$body_file" -w "%{http_code}" \
+    -X POST "$token_url" \
+    --get \
+    --data-urlencode "email=${email}" \
+    --data-urlencode "api_key=${api_key}"
+}
+
 main() {
   require_command curl
   require_command jq
@@ -146,18 +159,23 @@ main() {
   declare -a token_candidates=(
     "https://api.cloudways.com/api/v2/oauth/token|json"
     "https://api.cloudways.com/api/v2/oauth/token|form"
+    "https://api.cloudways.com/api/v2/oauth/token|query"
     "https://api.cloudways.com/api/v2/oauth/access_token|form"
     "https://api.cloudways.com/api/v2/oauth/access_token|json"
+    "https://api.cloudways.com/api/v2/oauth/access_token|query"
     "https://api.cloudways.com/api/v1/oauth/access_token|form"
     "https://api.cloudways.com/api/v1/oauth/access_token|json"
+    "https://api.cloudways.com/api/v1/oauth/access_token|query"
   )
 
   for candidate in "${token_candidates[@]}"; do
     IFS='|' read -r token_url token_format <<<"$candidate"
     if [[ "$token_format" == "json" ]]; then
       http_code="$(request_token_json "$token_url" "$EMAIL" "$API_KEY" "$token_body_file")"
-    else
+    elif [[ "$token_format" == "form" ]]; then
       http_code="$(request_token_form "$token_url" "$EMAIL" "$API_KEY" "$token_body_file")"
+    else
+      http_code="$(request_token_query "$token_url" "$EMAIL" "$API_KEY" "$token_body_file")"
     fi
     token_response="$(<"$token_body_file")"
     access_token="$(parse_token "$token_response")"
@@ -208,7 +226,9 @@ main() {
   monitor_response=""
   selected_monitor_url=""
   declare -a monitor_candidates=(
-    "https://api.cloudways.com/api/v2/server/monitor/${SERVER_ID}?type=${TYPE}"
+    "https://api.cloudways.com/api/v2/server/monitor/summary?server_id=${SERVER_ID}&type=${TYPE}"
+    "https://api.cloudways.com/api/v1/server/monitor/summary?server_id=${SERVER_ID}&type=${TYPE}"
+    # Legacy fallback in case account routes this way.
     "https://api.cloudways.com/api/v1/server/monitor/${SERVER_ID}?type=${TYPE}"
   )
 
