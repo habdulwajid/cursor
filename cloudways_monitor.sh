@@ -5,7 +5,6 @@ set -o nounset
 set -o pipefail
 
 API_BASE_URL="https://api.cloudways.com/api/v2"
-TOKEN_URL="${API_BASE_URL}/oauth/token"
 
 require_command() {
   local cmd="$1"
@@ -26,23 +25,25 @@ extract_error() {
 }
 
 request_token_json() {
-  local email="$1"
-  local api_key="$2"
-  local body_file="$3"
+  local token_url="$1"
+  local email="$2"
+  local api_key="$3"
+  local body_file="$4"
 
   curl -sS -o "$body_file" -w "%{http_code}" \
-    -X POST "$TOKEN_URL" \
+    -X POST "$token_url" \
     -H "Content-Type: application/json" \
     -d "{\"email\":\"${email}\",\"api_key\":\"${api_key}\"}"
 }
 
 request_token_form() {
-  local email="$1"
-  local api_key="$2"
-  local body_file="$3"
+  local token_url="$1"
+  local email="$2"
+  local api_key="$3"
+  local body_file="$4"
 
   curl -sS -o "$body_file" -w "%{http_code}" \
-    -X POST "$TOKEN_URL" \
+    -X POST "$token_url" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "email=${email}" \
     --data-urlencode "api_key=${api_key}"
@@ -66,16 +67,33 @@ main() {
   monitor_body_file="$(mktemp)"
   trap 'rm -f "$token_body_file" "$monitor_body_file"' EXIT
 
-  http_code="$(request_token_json "$EMAIL" "$API_KEY" "$token_body_file")"
-  token_response="$(<"$token_body_file")"
-  access_token="$(parse_token "$token_response")"
+  access_token=""
+  http_code=""
+  token_response=""
 
-  # Fallback to form-encoded payload in case account/API expects that format.
-  if [[ -z "$access_token" ]]; then
-    http_code="$(request_token_form "$EMAIL" "$API_KEY" "$token_body_file")"
+  # Cloudways auth can exist on different paths between API versions/accounts.
+  declare -a token_candidates=(
+    "https://api.cloudways.com/api/v2/oauth/token|json"
+    "https://api.cloudways.com/api/v2/oauth/token|form"
+    "https://api.cloudways.com/api/v2/oauth/access_token|form"
+    "https://api.cloudways.com/api/v2/oauth/access_token|json"
+    "https://api.cloudways.com/api/v1/oauth/access_token|form"
+    "https://api.cloudways.com/api/v1/oauth/access_token|json"
+  )
+
+  for candidate in "${token_candidates[@]}"; do
+    IFS='|' read -r token_url token_format <<<"$candidate"
+    if [[ "$token_format" == "json" ]]; then
+      http_code="$(request_token_json "$token_url" "$EMAIL" "$API_KEY" "$token_body_file")"
+    else
+      http_code="$(request_token_form "$token_url" "$EMAIL" "$API_KEY" "$token_body_file")"
+    fi
     token_response="$(<"$token_body_file")"
     access_token="$(parse_token "$token_response")"
-  fi
+    if [[ -n "$access_token" ]]; then
+      break
+    fi
+  done
 
   if [[ -z "$access_token" ]]; then
     echo "Error fetching access token (HTTP $http_code)." >&2
@@ -115,12 +133,23 @@ main() {
   echo "Fetching monitoring summary for Server ID: $SERVER_ID (type=$TYPE)..."
   echo
 
-  monitor_url="${API_BASE_URL}/server/monitor/${SERVER_ID}?type=${TYPE}"
-  monitor_http_code="$(curl -sS -o "$monitor_body_file" -w "%{http_code}" \
-    -X GET "$monitor_url" \
-    -H "Accept: application/json" \
-    -H "Authorization: Bearer ${access_token}")"
-  monitor_response="$(<"$monitor_body_file")"
+  monitor_http_code=""
+  monitor_response=""
+  declare -a monitor_candidates=(
+    "https://api.cloudways.com/api/v2/server/monitor/${SERVER_ID}?type=${TYPE}"
+    "https://api.cloudways.com/api/v1/server/monitor/${SERVER_ID}?type=${TYPE}"
+  )
+
+  for monitor_url in "${monitor_candidates[@]}"; do
+    monitor_http_code="$(curl -sS -o "$monitor_body_file" -w "%{http_code}" \
+      -X GET "$monitor_url" \
+      -H "Accept: application/json" \
+      -H "Authorization: Bearer ${access_token}")"
+    monitor_response="$(<"$monitor_body_file")"
+    if [[ "$monitor_http_code" =~ ^2 ]]; then
+      break
+    fi
+  done
 
   if [[ ! "$monitor_http_code" =~ ^2 ]]; then
     echo "Monitoring request failed (HTTP $monitor_http_code)." >&2
