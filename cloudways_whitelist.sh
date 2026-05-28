@@ -18,6 +18,9 @@ API_V2="https://api.cloudways.com/api/v2"
 
 HTTP_BODY=""
 HTTP_CODE=""
+FETCHED_IPS=()
+FETCH_CONFIDENT=0
+FETCH_SOURCE=""
 
 print_header() {
   echo -e "${CYAN}================================================${NC}"
@@ -94,6 +97,86 @@ extract_ip_list() {
     | unique
     | .[]
   ' <<<"$1" 2>/dev/null
+}
+
+extract_ip_list_from_text() {
+  jq -r '
+    tostring
+    | scan("([0-9]{1,3}(?:\\.[0-9]{1,3}){3}(?:\\/(?:3[0-2]|[12]?[0-9]))?)")[]
+  ' <<<"$1" 2>/dev/null | awk '!seen[$0]++'
+}
+
+has_known_whitelist_shape() {
+  jq -e '
+    (.sftp? | type == "array")
+    or (.ip_list? | type == "array")
+    or (.data.ip_list? | type == "array")
+    or (.data.sftp? | type == "array")
+    or (.whitelisted? | type == "array")
+    or (.whitelisted.sftp? | type == "array")
+  ' >/dev/null 2>&1 <<<"$1"
+}
+
+fetch_existing_sftp_ips() {
+  local server_id="$1"
+  local entry
+  local trust_empty
+  local url
+  local err
+
+  FETCHED_IPS=()
+  FETCH_CONFIDENT=0
+  FETCH_SOURCE=""
+
+  # trust_empty=1 means an explicitly empty list from this endpoint can be trusted.
+  for entry in \
+    "1|${API_V1}/security/whitelisted?server_id=${server_id}&tab=sftp&type=sftp" \
+    "1|${API_V1}/security/whitelisted?server_id=${server_id}&type=sftp" \
+    "1|${API_V1}/security/whitelisted?server_id=${server_id}&tab=sftp" \
+    "0|${API_V1}/security/whitelisted?server_id=${server_id}"
+  do
+    trust_empty="${entry%%|*}"
+    url="${entry#*|}"
+
+    http_request GET "$url" \
+      -H 'Accept: application/json' \
+      -H "Authorization: Bearer ${ACCESS_TOKEN}"
+
+    if ! jq -e . >/dev/null 2>&1 <<<"$HTTP_BODY"; then
+      continue
+    fi
+
+    err="$(json_get_error "$HTTP_BODY")"
+    if [[ -n "$err" ]]; then
+      continue
+    fi
+
+    mapfile -t FETCHED_IPS < <(extract_ip_list "$HTTP_BODY")
+    if [[ "${#FETCHED_IPS[@]}" -gt 0 ]]; then
+      FETCH_CONFIDENT=1
+      FETCH_SOURCE="$url"
+      return 0
+    fi
+
+    mapfile -t FETCHED_IPS < <(extract_ip_list_from_text "$HTTP_BODY")
+    if [[ "${#FETCHED_IPS[@]}" -gt 0 ]]; then
+      FETCH_CONFIDENT=1
+      FETCH_SOURCE="$url (text scan)"
+      return 0
+    fi
+
+    if [[ "$trust_empty" -eq 1 ]] && has_known_whitelist_shape "$HTTP_BODY"; then
+      FETCHED_IPS=()
+      FETCH_CONFIDENT=1
+      FETCH_SOURCE="$url (explicit empty)"
+      return 0
+    fi
+  done
+
+  FETCHED_IPS=()
+  FETCH_CONFIDENT=0
+  FETCH_SOURCE="no trusted SSH/SFTP whitelist response"
+  return 1
 }
 
 is_success_response() {
@@ -283,18 +366,15 @@ SKIP_COUNT=0
 while IFS=$'\t' read -r server_id public_ip server_label _cloud _region _instance; do
   echo -e "${YELLOW}[→] ${server_label} (ID: ${server_id} | IP: ${public_ip})${NC}"
 
-  http_request GET "${API_V1}/security/whitelisted?server_id=${server_id}" \
-    -H 'Accept: application/json' \
-    -H "Authorization: Bearer ${ACCESS_TOKEN}"
-
-  if ! jq -e . >/dev/null 2>&1 <<<"$HTTP_BODY"; then
-    echo -e "  ${RED}[✗] Failed to fetch current whitelist (HTTP ${HTTP_CODE}).${NC}"
-    echo -e "      ${HTTP_BODY:0:220}"
+  if ! fetch_existing_sftp_ips "$server_id" || [[ "$FETCH_CONFIDENT" -ne 1 ]]; then
+    echo -e "  ${RED}[✗] Unable to safely read existing SSH/SFTP whitelist.${NC}"
+    echo -e "      Skipping update to prevent accidental overwrite."
+    echo -e "      Fetch detail: ${FETCH_SOURCE}"
     FAIL_COUNT=$((FAIL_COUNT + 1))
     continue
   fi
 
-  mapfile -t EXISTING_IPS < <(extract_ip_list "$HTTP_BODY")
+  EXISTING_IPS=("${FETCHED_IPS[@]}")
   EXISTING_COUNT="${#EXISTING_IPS[@]}"
 
   ALREADY_PRESENT=0
@@ -313,11 +393,39 @@ while IFS=$'\t' read -r server_id public_ip server_label _cloud _region _instanc
 
   MERGED_IPS=("${EXISTING_IPS[@]}" "$WHITELIST_IP")
   echo -e "  ${CYAN}[i] Current whitelist: ${EXISTING_COUNT} IP(s) — merging and reposting...${NC}"
+  echo -e "      Source: ${FETCH_SOURCE}"
 
   if update_whitelist "$server_id" "${MERGED_IPS[@]}"; then
-    TOTAL="${#MERGED_IPS[@]}"
-    echo -e "  ${GREEN}[✓] Success — whitelist now has ${TOTAL} IP(s).${NC}"
-    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    if fetch_existing_sftp_ips "$server_id" && [[ "$FETCH_CONFIDENT" -eq 1 ]]; then
+      FINAL_IPS=("${FETCHED_IPS[@]}")
+      MISSING_IP=0
+      for ip in "${MERGED_IPS[@]}"; do
+        FOUND_IP=0
+        for final_ip in "${FINAL_IPS[@]}"; do
+          if [[ "$final_ip" == "$ip" ]]; then
+            FOUND_IP=1
+            break
+          fi
+        done
+        if [[ "$FOUND_IP" -ne 1 ]]; then
+          MISSING_IP=1
+          break
+        fi
+      done
+
+      if [[ "$MISSING_IP" -eq 0 ]]; then
+        TOTAL="${#FINAL_IPS[@]}"
+        echo -e "  ${GREEN}[✓] Success — whitelist now has ${TOTAL} IP(s).${NC}"
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+      else
+        echo -e "  ${RED}[✗] Update response looked successful, but verification failed.${NC}"
+        echo -e "      Existing IPs may not have been preserved; review server whitelist manually."
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+    else
+      echo -e "  ${YELLOW}[!] Updated, but could not re-verify final whitelist safely.${NC}"
+      SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    fi
   else
     ERR_MSG="$(json_get_error "$HTTP_BODY")"
     [[ -z "$ERR_MSG" ]] && ERR_MSG="$HTTP_BODY"
